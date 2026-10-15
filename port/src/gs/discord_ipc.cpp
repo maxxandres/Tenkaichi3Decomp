@@ -4,6 +4,7 @@
 #include <cstring>
 #include <ctime>
 #include <cstdint>
+#include <cstdarg>
 #include <stdint.h>
 
 #if defined(_WIN32)
@@ -21,6 +22,21 @@
   #endif
   static int sSockFd = -1;
 #endif
+
+/* BT3_DISCORD_DEBUG=1 (any value): what happens on the connection goes to bt3_discord.log in the current directory */
+static void DiscordLog(const char *fmt, ...) {
+    static int sOn = -1;
+    if (sOn < 0) sOn = getenv("BT3_DISCORD_DEBUG") != NULL;
+    if (!sOn) return;
+    FILE *fp = fopen("bt3_discord.log", "a");
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
 
 static bool sConnected = false;
 static char sAppId[64] = {0};
@@ -46,23 +62,32 @@ struct DiscordHeader {
 static bool WritePacket(int32_t opcode, const char *payload) {
     if (!sConnected) return false;
 
+    /* Header and payload go out as ONE write: a Windows named pipe in message mode takes each write as a message,
+     * and Discord would read the header alone as a whole frame. */
+    static char frame[sizeof(DiscordHeader) + 2048];
+    size_t len = strlen(payload);
+    if (len > sizeof(frame) - sizeof(DiscordHeader)) return false;
+
     DiscordHeader header;
     header.opcode = opcode;
-    header.length = (int32_t)strlen(payload);
+    header.length = (int32_t)len;
+    memcpy(frame, &header, sizeof(header));
+    memcpy(frame + sizeof(header), payload, len);
+    size_t total = sizeof(header) + len;
 
 #if defined(_WIN32)
     DWORD written = 0;
-    if (!WriteFile(sPipeHandle, &header, sizeof(header), &written, NULL) ||
-        !WriteFile(sPipeHandle, payload, header.length, &written, NULL)) {
+    if (!WriteFile(sPipeHandle, frame, (DWORD)total, &written, NULL) || written != total) {
+        DiscordLog("write failed (opcode %d, %u of %u bytes, error %lu)", (int)opcode, (unsigned)written, (unsigned)total, (unsigned long)GetLastError());
         sConnected = false;
         CloseHandle(sPipeHandle);
         sPipeHandle = INVALID_HANDLE_VALUE;
         return false;
     }
+    DiscordLog("wrote opcode %d, %u bytes", (int)opcode, (unsigned)total);
     return true;
 #elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-    if (send(sSockFd, &header, sizeof(header), MSG_NOSIGNAL) != (ssize_t)sizeof(header) ||
-        send(sSockFd, payload, header.length, MSG_NOSIGNAL) != (ssize_t)header.length) {
+    if (send(sSockFd, frame, total, MSG_NOSIGNAL) != (ssize_t)total) {
         sConnected = false;
         close(sSockFd);
         sSockFd = -1;
@@ -99,7 +124,13 @@ void Discord_Init(const char *application_id) {
         sPipeHandle = CreateFileA(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
         if (sPipeHandle != INVALID_HANDLE_VALUE) {
             sConnected = true;
+            DiscordLog("opened %s", pipeName);
             break;
+        }
+        DWORD err = GetLastError();
+        DiscordLog("cannot open %s (error %lu)", pipeName, (unsigned long)err);
+        if (err == ERROR_ACCESS_DENIED) { /* the pipe is there but not ours to open */
+            DiscordLog("access denied: Discord probably runs as administrator and the game does not (or the reverse)");
         }
     }
 #elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
@@ -148,7 +179,10 @@ void Discord_Init(const char *application_id) {
     }
 #endif
 
-    if (!sConnected) return;
+    if (!sConnected) {
+        DiscordLog("no connection (Discord not running, or another user/permission level)");
+        return;
+    }
 
     // Send initial handshake JSON
     char handshakePayload[256];
@@ -263,7 +297,11 @@ void Discord_RunCallbacks(void) {
     DWORD bytesAvailable = 0;
     if (PeekNamedPipe(sPipeHandle, NULL, 0, NULL, &bytesAvailable, NULL) && bytesAvailable > 0) {
         DWORD readBytes = 0;
-        ReadFile(sPipeHandle, buffer, sizeof(buffer), &readBytes, NULL);
+        ReadFile(sPipeHandle, buffer, sizeof(buffer) - 1, &readBytes, NULL);
+        if (readBytes > 8) {
+            buffer[readBytes] = '\0';
+            DiscordLog("discord says: %s", buffer + 8); /* (after the 8-byte header) */
+        }
     }
 #elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
     ssize_t n = recv(sSockFd, buffer, sizeof(buffer), MSG_DONTWAIT);

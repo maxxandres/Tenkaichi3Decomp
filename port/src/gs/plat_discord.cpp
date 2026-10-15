@@ -6,9 +6,16 @@
  *   - Port_VBlank()          (plat_stub.c) → PortDiscord_Tick()
  *   - atexit()                             → PortDiscord_Shutdown()
  *
- * Safe: Reads game memory exclusively via Port_Ptr(addr) on 32-bit game
+ * Safe: Reads game memory exclusively via SafePtr(addr, len) on 32-bit game
  * addresses, using explicit byte-offset loads. Completely immune to 64-bit
  * struct padding or pointer-width discrepancies between compilers.
+ *
+ * How it works: every 5th tick PortDiscord_Tick() asks "in a battle?" (PollInBattle). If so UpdateBattle() builds the
+ * presence from gBattleWork, else UpdateMenu() builds it from the progress mode (gProgress + 0x18) and, on the
+ * select screens, from the screen's own structs. A presence is only built when something changed, and
+ * DispatchDiscordUpdate() holds it back if one went out in the last 10 s (Discord's rate limit).
+ *
+ * Settings (bt3_settings.txt): discord=0 turns it off. Env: BT3_NO_DISCORD, BT3_DISCORD=0.
  */
 
 #include "plat_discord.h"
@@ -21,6 +28,11 @@
 #include <ctime>
 #include <cstdint>
 #include <chrono>
+
+#if defined(__linux__)
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 /* Rate limiter constants: 10 seconds */
 #define DISCORD_RATE_LIMIT_MS 10000ULL
@@ -83,8 +95,32 @@ extern "C" {
     extern char gPortStageNames[26][64];
     extern int gPortExtraStageCount;
 
+    /* Title of the port's own screen that runs now ("" if none), set by PortScreen_Main (menu/port_screen.c) */
+    extern char gPortScreenTitle[64];
+    extern char gPortScreenDetail[64];
+
     /* UTF-8 decoder from a11y.c */
     int PortA11y_Utf8(char *out, int cap, const uint16_t *str);
+}
+
+/* A game address as a pointer, only if the len bytes from it can be read (NULL otherwise). Port_Ptr is a plain
+ * cast on Linux and Windows, so a stale or garbage pointer (a screen's struct after the screen is gone) would crash
+ * the game from here. On Linux the first and last byte are probed with process_vm_readv, which fails with EFAULT
+ * instead of faulting; elsewhere only an obviously invalid address is rejected. */
+static const void *SafePtr(uint32_t addr, size_t len) {
+    /* (every pointer read from the game goes through here: a screen's struct may be freed between two ticks) */
+    if (addr < 0x10000 || len == 0) return nullptr;
+    const void *p = Port_Ptr(addr);
+#if defined(__linux__)
+    const char *ends[2] = { (const char *)p, (const char *)p + (len - 1) };
+    for (int i = 0; i < 2; i++) {
+        char b;
+        struct iovec local = { &b, 1 };
+        struct iovec remote = { (void *)ends[i], 1 };
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 1) return nullptr;
+    }
+#endif
+    return p;
 }
 
 #define PORT_STAGE_FIRST 0x24
@@ -95,6 +131,7 @@ extern "C" {
  * ============================================================ */
 #define DISCORD_APP_ID   "1559682390878585305"
 #define DISCORD_LOGO     "main_logo"
+#define DISCORD_STAGE_UNLISTED "stage_unlisted" /* the large image of a stage the disc does not have */
 #define DISCORD_TOOLTIP  "Dragon Ball Z: Budokai Tenkaichi 3"
 
 #define BTL_MODE_VERSUS   0
@@ -372,15 +409,19 @@ static char sDynamicNames[DYNAMIC_CHARA_MAX][64];
 static int ReadTextLine(char *out, int cap, uint32_t gameFileAddr, int n) {
     out[0] = '\0';
     if (!gameFileAddr || n < 0 || n >= 0x1000) return 0;
-    const uint32_t *file = (const uint32_t *)Port_Ptr(gameFileAddr);
+    const uint32_t *file = (const uint32_t *)SafePtr(gameFileAddr, 8);
     if (!file) return 0;
 
     uint32_t firstOfs = file[1] >> 2;
-    if ((uint32_t)n + 1 >= firstOfs) return 0;
+    if (firstOfs > 0x1000 || (uint32_t)n + 1 >= firstOfs) return 0;
+    /* the offset table itself must be readable up to entry n+1 */
+    if (!SafePtr(gameFileAddr, ((size_t)n + 2) * 4)) return 0;
 
     uint32_t ofs = (file[n + 1] >> 2) << 2;
-    if (ofs == 0 || ofs >= 0x200000) return 0;
+    if (ofs < firstOfs * 4 || ofs >= 0x200000) return 0;
 
+    /* the string starts after the table and must be 2-byte aligned and readable */
+    if ((ofs & 1) || !SafePtr(gameFileAddr + ofs, 2)) return 0;
     const uint16_t *str = (const uint16_t *)((const uint8_t *)file + ofs);
     if (str[0] != 0xFEFF) return 0;
 
@@ -405,10 +446,18 @@ static void CleanBadges(char *str) {
     }
 }
 
+/* The select screens keep the fighters' names as game text (UTF-16 tables); they are converted once per table into
+ * sDynamicNames, so a character added by a mod has its name too. */
 static void CacheSelectNames(uint32_t nameTextAddr, uint32_t formTextAddr) {
+    /* The text tables only change when the screen loads other ones: read them again only then */
+    static uint32_t sCachedName = 0, sCachedForm = 0;
     if (!nameTextAddr) return;
-    const uint32_t *nameFile = (const uint32_t *)Port_Ptr(nameTextAddr);
+    if (nameTextAddr == sCachedName && formTextAddr == sCachedForm) return;
+    const uint32_t *nameFile = (const uint32_t *)SafePtr(nameTextAddr, 8);
     if (!nameFile) return;
+    sCachedName = nameTextAddr;
+    sCachedForm = formTextAddr;
+    memset(sDynamicNames, 0, sizeof(sDynamicNames)); /* no name of a previous list survives */
 
     int lines = (int)(nameFile[1] >> 2) - 1;
     if (lines <= 0) lines = CHARA_MAX;
@@ -441,6 +490,8 @@ static int       sLastBtlMode      = -1;
 static int       sLastStage        = -1;
 static int       sLastChar0        = -1;
 static int       sLastChar1        = -1;
+static char      sLastTitle[64]    = "";
+static char      sLastDetail[64]   = "";
 static int       sTickCounter      = 0;
 static int       sBattleInFlight   = 0;
 static int       sBattleRosterSeen = 0;
@@ -489,7 +540,7 @@ static const char *BtlModeName(int btlMode, int side1IsCPU) {
 static int GetProgressMode() {
     uint32_t progAddr = gProgress;
     if (!progAddr) return 1;
-    const uint8_t *prog = (const uint8_t *)Port_Ptr(progAddr);
+    const uint8_t *prog = (const uint8_t *)SafePtr(progAddr, 0x1C);
     if (!prog) return 1;
     /* mode is an int at offset 0x18 */
     int m = 1;
@@ -600,7 +651,7 @@ static void UpdateBattle(void) {
     if (stageId >= 0 && stageId < 35) {
         snprintf(stageKey, sizeof(stageKey), "stage_%d", stageId);
     } else {
-        snprintf(stageKey, sizeof(stageKey), "%s", DISCORD_LOGO);
+        snprintf(stageKey, sizeof(stageKey), "%s", DISCORD_STAGE_UNLISTED);
     }
 
     /* Large image: Stage preview thumbnail with stage name tooltip.
@@ -608,12 +659,15 @@ static void UpdateBattle(void) {
     DispatchDiscordUpdate(state, details, stageKey, stageName, DISCORD_LOGO, DISCORD_TOOLTIP, sModeSwitchTime);
 }
 
+/* Menus: `mode` is gProgress->mode. The select screens (39/45 character, 40/41 team) also give the picked fighters,
+ * read from the screen's struct. The presence is rebuilt only when the mode, the fighters, or the title/page of a
+ * port screen (gPortScreenTitle / gPortScreenDetail, mode 80) changed. */
 static void UpdateMenu(int mode) {
     int char0 = -1, char1 = -1;
 
     /* Live character selection reading */
     if ((mode == 39 || mode == 45) && gCharSel != 0) {
-        const uint8_t *cs = (const uint8_t *)Port_Ptr(gCharSel);
+        const uint8_t *cs = (const uint8_t *)SafePtr(gCharSel, 0x500);
         if (cs) {
             uint32_t nameTextAddr = 0, formTextAddr = 0;
             __builtin_memcpy(&nameTextAddr, cs + 0x28, sizeof(uint32_t));
@@ -625,7 +679,7 @@ static void UpdateMenu(int mode) {
             __builtin_memcpy(&side1Addr, cs + 0x4FC, sizeof(uint32_t));
 
             if (side0Addr != 0) {
-                const uint8_t *s0 = (const uint8_t *)Port_Ptr(side0Addr);
+                const uint8_t *s0 = (const uint8_t *)SafePtr(side0Addr, 0x74);
                 if (s0) {
                     int state = 0, chara = -1, picked = -1;
                     __builtin_memcpy(&state, s0 + 0x70, sizeof(int));
@@ -635,7 +689,7 @@ static void UpdateMenu(int mode) {
                 }
             }
             if (side1Addr != 0) {
-                const uint8_t *s1 = (const uint8_t *)Port_Ptr(side1Addr);
+                const uint8_t *s1 = (const uint8_t *)SafePtr(side1Addr, 0x74);
                 if (s1) {
                     int state = 0, chara = -1, picked = -1;
                     __builtin_memcpy(&state, s1 + 0x70, sizeof(int));
@@ -646,7 +700,7 @@ static void UpdateMenu(int mode) {
             }
         }
     } else if ((mode == 40 || mode == 41) && gTeamSel != 0) {
-        const uint8_t *ts = (const uint8_t *)Port_Ptr(gTeamSel);
+        const uint8_t *ts = (const uint8_t *)SafePtr(gTeamSel, 0x8F0);
         if (ts) {
             uint32_t nameTextAddr = 0, formTextAddr = 0;
             __builtin_memcpy(&nameTextAddr, ts + 0x28, sizeof(uint32_t));
@@ -658,23 +712,32 @@ static void UpdateMenu(int mode) {
             __builtin_memcpy(&side1Addr, ts + 0x8EC, sizeof(uint32_t));
 
             if (side0Addr != 0) {
-                const uint8_t *s0 = (const uint8_t *)Port_Ptr(side0Addr);
+                const uint8_t *s0 = (const uint8_t *)SafePtr(side0Addr, 0x13C);
                 if (s0) __builtin_memcpy(&char0, s0 + 0x138, sizeof(int));
             }
             if (side1Addr != 0) {
-                const uint8_t *s1 = (const uint8_t *)Port_Ptr(side1Addr);
+                const uint8_t *s1 = (const uint8_t *)SafePtr(side1Addr, 0x13C);
                 if (s1) __builtin_memcpy(&char1, s1 + 0x138, sizeof(int));
             }
         }
     }
 
+    /* A screen of the port's own (or a mod's) names itself; a mode nobody named stays "In Menus" */
+    char title[64];
+    snprintf(title, sizeof(title), "%s", gPortScreenTitle);
+    char page[64];
+    snprintf(page, sizeof(page), "%s", gPortScreenDetail);
+
     int changed = (mode != sLastMode || sLastInBattle != 0 ||
-                   char0 != sLastChar0 || char1 != sLastChar1);
+                   char0 != sLastChar0 || char1 != sLastChar1 ||
+                   strcmp(title, sLastTitle) != 0 || strcmp(page, sLastDetail) != 0);
     if (!changed) return;
 
     if (mode != sLastMode || sLastInBattle != 0) {
         sModeSwitchTime = (long long)time(nullptr);
     }
+    snprintf(sLastTitle, sizeof(sLastTitle), "%s", title);
+    snprintf(sLastDetail, sizeof(sLastDetail), "%s", page);
     sLastMode     = mode;
     sLastInBattle = 0;
     sLastBtlMode  = -1;
@@ -684,9 +747,12 @@ static void UpdateMenu(int mode) {
 
     char state[128];
     char details[128];
-    const uint8_t *prog = (gProgress != 0) ? (const uint8_t *)Port_Ptr(gProgress) : nullptr;
+    const uint8_t *prog = (gProgress != 0) ? (const uint8_t *)SafePtr(gProgress, 0x88) : nullptr;
 
-    if (mode == 1) {
+    if (title[0] != '\0') {
+        snprintf(state, sizeof(state), "%s", title);
+        snprintf(details, sizeof(details), "%s", page[0] != '\0' ? page : "In Menus");
+    } else if (mode == 1) {
         snprintf(state, sizeof(state), "Title Screen");
         snprintf(details, sizeof(details), "Press Start");
     } else if (mode == 2) {
@@ -808,8 +874,13 @@ static void UpdateMenu(int mode) {
 extern "C" {
 
 extern int Port_Setting(const char *name, int def);
+extern void Port_SettingSave(const char *name, int value);
+extern void Port_SettingsWrite(void);
 
 void PortDiscord_Init(void) {
+    /* The setting is on by default: write it into bt3_settings.txt so it is there to turn off (discord=0) */
+    Port_SettingSave("discord", Port_Setting("discord", 1));
+    Port_SettingsWrite();
     const char *gs = getenv("BT3_GS");
     if (gs && strcmp(gs, "none") == 0) return;
     if (getenv("BT3_DEMO") != nullptr)  return;
