@@ -20,6 +20,7 @@ typedef struct PortVideo {
     int frameSkip;   /* 1 = a tick's picture is left out when the machine is behind, instead of the game slowing down */
     int hudLayout;   /* a fight's HUD in a wide picture: 0 at the edges, 1 at the edges with long health bars, 2 in the middle as in 4:3 */
     int menuFont;    /* 0 Original (default), then entries in the generated font catalog */
+    int battleFont; /* 0 original battle artwork (default), otherwise a font listed for battle */
     int textFont;    /* separate font for dialogue and other shared Font_Print text */
     int smooth2d;    /* "2D filtering": 0 sharp (a PS2 pixel is a block), 1 smooth (sampled per output pixel) */
 } PortVideo;
@@ -47,6 +48,8 @@ int *PortInput_OverlayKey(void);       /* the key that opens and closes the sett
 int *PortInput_OverlayPad(void);       /* the controller button that does (-1 = none; START + SELECT always do) */
 int PortInput_Hotkey(const SDL_Event *ev); /* 1 = the event opens or closes the settings window */
 void PortInput_Swallow(void);           /* the controller buttons held now are not the game's until they are let go */
+void PortInput_SwallowKeys(void);       /* the same for the bound keys held now */
+int *PortInput_ChatKey(void);           /* the key that opens the online chat's line (scancode, 0 = none) */
 void PortInput_ResetDefaults(int player);
 #define PORT_DEADZONE_MAX 90   /* percent */
 #define PORT_TRIGGER_AT 12000  /* of 32767: from here a trigger counts as pressed */
@@ -66,9 +69,10 @@ void PortInput_StickView(int player, PortStickView *out);
 void PortInput_Save(void);
 extern int gPortOverlayOpen;   /* the settings window is open: neither keyboard nor controller reaches the game */
 extern int gPortInputCapture;  /* it is waiting for a key or button to bind: nothing reaches the game */
+extern int gPortChatTyping;    /* a line of the online chat is being typed: the keyboard does not reach the game */
 
 /* ui.cpp */
-int Ui_Init(SDL_Window *window, SDL_GPUDevice *device, void *gl_context); /* device: the SDL GPU back end; NULL and a GL context: the OpenGL one */
+int Ui_Init(SDL_Window *window, SDL_GPUDevice *device, void *gl_context, const char *gpu_name); /* device: the SDL GPU back end; NULL and a GL context: the OpenGL one */
 void Ui_DrawGL(void); /* the OpenGL back end: draws this frame's window with the context current */
 int Ui_Event(const SDL_Event *ev); /* 1 = the window used the event */
 int GsDraw_FrameSkip(void);       /* gs_draw.c */

@@ -21,7 +21,7 @@
 #include "gs_internal.h"
 #include "ui.h"
 
-int gPortOverlayOpen, gPortInputCapture;
+int gPortOverlayOpen, gPortInputCapture, gPortChatTyping;
 extern int Port_Setting(const char *name, int def); /* plat_settings.c */
 extern void Port_SettingSave(const char *name, int value), Port_SettingsWrite(void);
 
@@ -62,8 +62,11 @@ static int sDeadzone[2][2], sVib[2][2];
 /* What opens and closes the settings window: a key (F1) and a controller button (none), both of the settings
    window's list; and START + SELECT of any controller together, always. */
 static int sOverlayKey = SDL_SCANCODE_F1, sOverlayPad = -1;
+static int sChatKey = SDL_SCANCODE_TAB; /* opens the online chat's line (setting key_chat; Tab by default) */
 static int sComboLatch; /* START + SELECT has opened or closed the window and is still held */
 static int sSwallow; /* a controller opened or closed the window: nothing of the controllers reaches the game until those buttons are let go */
+static volatile int sKeySwallow; /* the chat's line was sent or put away: nothing of the keyboard reaches the game until no bound key is held
+                                    (Enter, which sends it, is START) */
 static pthread_once_t sLoadOnce = PTHREAD_ONCE_INIT;
 
 static void defaults(int player) {
@@ -114,6 +117,7 @@ static void load(void) {
     }
     sOverlayKey = Port_Setting("key_overlay", SDL_SCANCODE_F1);
     sOverlayPad = Port_Setting("pad_overlay", -1);
+    sChatKey = Port_Setting("key_chat", SDL_SCANCODE_TAB);
 }
 
 const char *PortInput_ActionLabel(int action) { return kActions[action].label; }
@@ -164,6 +168,160 @@ int PortInput_Hotkey(const SDL_Event *ev) {
 }
 /* The settings window closed, or its exit question was answered, with a controller button: that press is not the game's. */
 void PortInput_Swallow(void) { sSwallow = 2; }
+void PortInput_SwallowKeys(void) { sKeySwallow = 1; }
+
+/* Tenkaichi Budokai Online's keypads (src/menu/port_tbo.c): while one takes text (gPortTboTyping), what is typed
+   goes to it, a character at a time (PortTbo_TextRead: the character, 8 backspace, 13 enter, 27 escape, 0 none),
+   and the keys that type (letters, digits, space, punctuation, enter, backspace, escape) are not the pad's: the
+   arrow keys and the controller still move on the keypad. The window's events come in on the renderer's thread
+   (PortInput_TboEvent, from Ui_Event), the game reads them on its own. */
+int gPortTboTyping;
+static char sTboKeys[64];
+static unsigned sTboHead, sTboTail;
+static SDL_SpinLock sTboLock;
+
+static int typing_key(int sc) {
+    return (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_SLASH && sc != SDL_SCANCODE_TAB) ||
+           (sc >= SDL_SCANCODE_KP_DIVIDE && sc <= SDL_SCANCODE_KP_PERIOD);
+}
+
+static void tbo_push(int c) {
+    SDL_LockSpinlock(&sTboLock);
+    if (sTboHead - sTboTail < sizeof(sTboKeys)) {
+        sTboKeys[sTboHead++ % sizeof(sTboKeys)] = (char)c;
+    }
+    SDL_UnlockSpinlock(&sTboLock);
+}
+
+void PortTbo_TextMode(int on) {
+    SDL_LockSpinlock(&sTboLock);
+    sTboHead = sTboTail = 0;
+    SDL_UnlockSpinlock(&sTboLock);
+    if (gPortTboTyping && !on) {
+        sKeySwallow = 1; /* (Enter, which ended it, is START: not the game's until it is let go) */
+    }
+    gPortTboTyping = on != 0;
+}
+
+int PortTbo_TextRead(void) {
+    int c = 0;
+    SDL_LockSpinlock(&sTboLock);
+    if (sTboTail != sTboHead) {
+        c = (unsigned char)sTboKeys[sTboTail++ % sizeof(sTboKeys)];
+    }
+    SDL_UnlockSpinlock(&sTboLock);
+    return c;
+}
+
+/* "Copy Code" (the room's code, to give the rival): the game's thread hands the text over, the window's thread
+   puts it on the clipboard (PortInput_TboClipboard, from the overlay's frame: SDL wants the clipboard there). */
+static char sTboCopy[64];
+static int sTboCopyDue;
+static int sTboPasteDue; /* the keypad's PASTE (Join Room): the clipboard's room code, typed on the window's thread */
+
+void PortTbo_Copy(const char *text) {
+    SDL_LockSpinlock(&sTboLock);
+    SDL_strlcpy(sTboCopy, text != NULL ? text : "", sizeof(sTboCopy));
+    sTboCopyDue = sTboCopy[0] != '\0';
+    SDL_UnlockSpinlock(&sTboLock);
+}
+
+void PortTbo_Paste(void) {
+    SDL_LockSpinlock(&sTboLock);
+    sTboPasteDue = 1;
+    SDL_UnlockSpinlock(&sTboLock);
+}
+
+/* The room code in a copied text: the last run of exactly six letters and digits ("Room code: MFT8FD"); without
+   one, every letter and digit of it. Typed as if by hand. */
+static void tbo_paste_code(const char *clip) {
+    const unsigned char *p = (const unsigned char *)clip, *code = NULL;
+    int run = 0, n = 0;
+
+    for (; p != NULL && *p; p++) {
+        int alnum = (*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z');
+        run = alnum ? run + 1 : 0;
+        if (run == 6 && !((p[1] >= '0' && p[1] <= '9') || (p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z'))) {
+            code = p - 5;
+        }
+    }
+    if (code != NULL) {
+        for (n = 0; n < 6; n++) {
+            tbo_push(code[n]);
+        }
+        return;
+    }
+    for (p = (const unsigned char *)clip; p != NULL && *p && n < 48; p++) {
+        if ((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) {
+            tbo_push(*p);
+            n++;
+        }
+    }
+}
+
+void PortInput_TboClipboard(void) {
+    char text[sizeof(sTboCopy)];
+    int due, paste;
+    SDL_LockSpinlock(&sTboLock);
+    due = sTboCopyDue;
+    sTboCopyDue = 0;
+    paste = sTboPasteDue;
+    sTboPasteDue = 0;
+    memcpy(text, sTboCopy, sizeof(text));
+    SDL_UnlockSpinlock(&sTboLock);
+    if (due) {
+        SDL_SetClipboardText(text);
+    }
+    if (paste) {
+        char *clip = SDL_GetClipboardText();
+        tbo_paste_code(clip);
+        SDL_free(clip);
+    }
+}
+
+/* 1: the event was the keypad's. Only plain characters (32..126) are typed: a name or a room code. */
+int PortInput_TboEvent(const SDL_Event *ev) {
+    if (!gPortTboTyping) {
+        return 0;
+    }
+    if (ev->type == SDL_EVENT_TEXT_INPUT) {
+        const unsigned char *p = (const unsigned char *)ev->text.text;
+        for (; p != NULL && *p; p++) {
+            if (*p >= 32 && *p < 127) {
+                tbo_push(*p);
+            }
+        }
+        return 1;
+    }
+    if (ev->type == SDL_EVENT_KEY_DOWN) {
+        SDL_Scancode sc = ev->key.scancode;
+        if (sc == SDL_SCANCODE_V && (ev->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) && !ev->key.repeat) {
+            /* Ctrl+V (Cmd+V): the clipboard's text, as if typed (a room code copied from a message); only its
+               plain characters, and no more than the keypad can hold */
+            char *clip = SDL_GetClipboardText();
+            const unsigned char *p = (const unsigned char *)clip;
+            int n = 0;
+            for (; p != NULL && *p && n < 48; p++) {
+                if (*p >= 32 && *p < 127) {
+                    tbo_push(*p);
+                    n++;
+                }
+            }
+            SDL_free(clip);
+            return 1;
+        }
+        if (sc == SDL_SCANCODE_BACKSPACE) {
+            tbo_push(8);
+        } else if ((sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER) && !ev->key.repeat) {
+            tbo_push(13);
+        } else if (sc == SDL_SCANCODE_ESCAPE && !ev->key.repeat) {
+            tbo_push(27);
+        }
+        return typing_key(sc);
+    }
+    return ev->type == SDL_EVENT_KEY_UP && typing_key(ev->key.scancode);
+}
+int *PortInput_ChatKey(void) { pthread_once(&sLoadOnce, load); return &sChatKey; }
 void PortInput_ResetDefaults(int player) { pthread_once(&sLoadOnce, load); defaults(player); }
 
 void PortInput_Save(void) {
@@ -191,6 +349,7 @@ void PortInput_Save(void) {
     }
     Port_SettingSave("key_overlay", sOverlayKey);
     Port_SettingSave("pad_overlay", sOverlayPad);
+    Port_SettingSave("key_chat", sChatKey);
     Port_SettingsWrite();
 }
 
@@ -708,6 +867,12 @@ void PortInput_VibrationTest(int player) {
     }
 }
 
+/* The controllers' and the keyboard's state as it is at this moment (plat_stub.c, "Low input lag": the pads are
+   read long after the window's events were last taken). The events themselves stay queued for the window. */
+void PortInput_Fresh(void) {
+    SDL_PumpEvents();
+}
+
 int Port_PadRead(int socket, unsigned char *data) {
     unsigned btn = 0;
     unsigned char rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
@@ -751,15 +916,27 @@ int Port_PadRead(int socket, unsigned char *data) {
         stick_bytes(sDeadzone[socket][0], SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY), &lx, &ly);
         stick_bytes(sDeadzone[socket][1], SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY), &rx, &ry);
     }
-    if (!gPortOverlayOpen) { /* the settings window takes the keyboard while it is open */
+    if (sKeySwallow) {
+        const bool *ks = SDL_GetKeyboardState(NULL);
+        int p, held = 0;
+        for (p = 0; p < 2; p++) {
+            for (a = 0; a < PORT_ACTIONS; a++) {
+                held = held || (sKeys[p][a] > 0 && sKeys[p][a] < SDL_SCANCODE_COUNT && ks[sKeys[p][a]]);
+            }
+        }
+        sKeySwallow = held;
+    }
+    /* the settings window takes the keyboard while it is open, and the online chat while a line is typed (the
+       controller still plays then) */
+    if (!gPortOverlayOpen && !gPortChatTyping && !sKeySwallow) {
         const bool *ks = SDL_GetKeyboardState(NULL);
         const int *k = sKeys[socket];
         for (a = 0; a < PORT_PAD_BUTTONS; a++) {
-            if (k[a] > 0 && k[a] < SDL_SCANCODE_COUNT && ks[k[a]]) {
+            if (k[a] > 0 && k[a] < SDL_SCANCODE_COUNT && ks[k[a]] && !(gPortTboTyping && typing_key(k[a]))) {
                 btn |= kActions[a].bit;
             }
         }
-#define HELD(n) (k[n] > 0 && k[n] < SDL_SCANCODE_COUNT && ks[k[n]])
+#define HELD(n) (k[n] > 0 && k[n] < SDL_SCANCODE_COUNT && ks[k[n]] && !(gPortTboTyping && typing_key(k[n])))
         if (HELD(16)) { ly = 0x00; }
         if (HELD(17)) { ly = 0xFF; }
         if (HELD(18)) { lx = 0x00; }

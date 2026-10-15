@@ -3132,7 +3132,8 @@ Two settings in F1 > UI, both "Original" unless chosen:
   hands the renderer the game's glyph table; the renderer packs the new glyphs into an atlas of its own and moves
   the sprite's texture coordinates there. The game's placement, line breaks, colours and shadows are untouched.
 
-The fonts (DejaVu Sans Condensed and Condensed Bold, Liberation Sans Bold, with their licences) are in
+The bundled fonts (DejaVu Sans Condensed for Dialogue / UI and Condensed Bold for menus, with their licence; later
+Fira Sans Condensed Bold for menus, under the SIL Open Font License: see the section on Tenkaichi Budokai Online) are in
 `port/third_party/fonts`, with the list `fonts.tsv`; a release has them as `fonts/`.
 
 What was changed on top of the pull request:
@@ -3194,7 +3195,8 @@ What was changed on top of the pull request:
    request's build: 112 of 113 the same bytes (the one, frame 1460, shows another hint line of the main menu in a
    fade: the game was at another moment there, the lettering is the same; two runs of one build differ in that
    frame too when several copies run at once).
-7. DejaVu Sans Condensed was in the repository twice (once per setting); it is there once and listed for both.
+7. DejaVu Sans Condensed was in the repository twice (once per setting); it is there once. It was listed for both
+   settings at the time of this change and is now listed only for Dialogue / UI.
    The dead font-building code in the tool is gone. The notes said the game's ordinary text is unaffected; the
    second setting replaces exactly that, and they say so now.
 
@@ -3325,12 +3327,112 @@ come out one last bit of the float ABOVE the depth the chip interpolates for the
 layer over the same triangles that does not write depth (the gloss) is then tested with the interpolated depth
 against a stored value one bit larger, fails "greater or equal", and the pixel keeps the layer below: a dot.
 
-Fix: the pipelines of bit 23 get a depth bias of two such bits towards the viewer (gs_gpu.c
-`depth_bias_constant_factor`, gs_gl.c `glPolygonOffset`). A depth step is thousands of those bits, so nothing
-else passes that should not. The speed rule stays as it is.
+Fix, first try (2080bfe, tagged v0.1.34.1 but never published): a depth bias of two float bits on the pipelines
+of bit 23. Wrong: with 16 million depth steps a step is about one such bit near the far end, so the bias was a
+step or two, and the user saw layers that should lose by one step win (shadow layers over clothes).
 
-Checked: the same frame of the recording, fixed, is the same picture as with `BT3_NZ=0` (0 pixels differ by more
-than a tenth; 0.1.34 has 214), at four moments of the fight the dots are gone; the replay check is unchanged.
-Not checked: Windows (Direct3D 12), macOS (Metal) and the OpenGL back end, where the size of the bias is the
-driver's to define; at more than 1x picture size; other shiny characters.
+Fix as it is now, in the shader that writes depth (gs.frag): where the division came out above z, the step below
+is written, so what is stored is never above the z it came from. Then "z >= stored" and "step of z >= stored" are
+the same thing, which is what the rule of bit 23 assumed, and nothing is biased.
 
+Checked with the recording, 60 pictures of the fight, every pixel: the default and `BT3_NZ=0` give the same
+picture in all 60 (0.1.34: 45 of 60 differ, by up to 328 pixels; the bias: 12 of 60, by 1 or 2 pixels). Against
+0.1.34's own full-shader picture, 8 of the 60 differ in one pixel each (the step below, where 0.1.34 wrote the
+step above). The replay check is unchanged.
+Not checked: Windows (Direct3D 12), macOS (Metal) and the OpenGL back end; other shiny characters; the scene in
+which the user saw the shadow layers (not in the recording).
+
+## Input lag: measured, and "Low input lag" (2026-10-14)
+
+Asked by the user: how large is the input lag, can it be lowered, or is it fixed by the game?
+
+`BT3_LAG_LOG=1` prints when things happen, in microseconds: `V` a vertical blank (after its wait), `W` the game
+arriving at a blank's wait, `R` a pad read, `E` the window's events taken (a controller's state is renewed then),
+`S` a picture handed to the window, `L` the owed blanks waited for (below). Measured with a recording of the user's
+(a fight against Perfect Cell), replayed at real speed without a window on an integrated graphics chip:
+
+- A fight's tick is two vertical blanks, 33.4 ms; a menu's is one.
+- The game's own order in a tick: read the pads, compute, give the drawing commands, THEN wait for the blanks,
+  then the picture is shown. Computing took 1.1 ms and showing 2 ms here, the wait the other 30.
+- So from a pad read to its picture: 33.35 ms (median). The controller's state was 1.1 ms old when read.
+- The game adds no tick of its own on top: with a recording cut off before a stick push and one that has it, the
+  very first picture after the read differs (movement; other actions have their own start-up frames).
+
+What is the game's: the 30 ticks a second of a fight (a press waits up to 33 ms, 17 on average, for the next
+read) and each action's start-up. What was the port's to give: the 30 ms of waiting between computing a tick and
+showing it. The console has the same wait and then draws and shows at the following blanks, so the port was already
+ahead of it.
+
+"Low input lag (experimental)" (F1 > Video; setting `late_input`; `BT3_LATE_INPUT=0/1`), off by default: a blank
+the game asks for is not waited for there but owed (at most two) and waited for just before the next pad read
+(plat_stub.c `late_wait`), where the controllers' state is renewed first (`PortInput_Fresh`). The tick is as long
+as before; the pads are read at its end instead of its start. Nothing of the game's state changes: the same reads
+and blanks in the same order. Not in an online session, and not with in-between pictures.
+
+Measured the same way with it on: read to picture 3.0 ms (median; 99% 3.5 ms), the controller's state 0.01 ms
+old, the tick 33.37 ms as before. The recording's pictures are the same with it on and off (seven compared), and
+the replay check is unchanged.
+
+Not checked: with a window on a real display, and by feel; the sound (the game's sound step runs at each blank,
+and those now come two at once in a fight); V-sync on; Windows and macOS; a machine too slow to compute and show
+a tick in time, where the picture then comes late instead of the game's start of the tick.
+
+
+## Tenkaichi Budokai Online: lettered like the game's menus (2026-10-14)
+
+The main menu's labels are not written in a font: every one is a picture on the disc (two label sheets per plate
+state, 512 x 256 and 512 x 128, eight bits with a 256-colour table, eight rows of 32 on the first and three used of
+four on the second). The PC's item "Tenkaichi Budokai Online" goes into the free fourth row of the second sheet of
+each state (src/menu/menu_a.c).
+
+Its label is now put together at start from the letters of the other ten labels of the player's own disc, with the
+letter cutter the names of added stages use (port/src/gs/namefont.c, run on the files by menu_labels.c,
+MenuLabels_MainItem). The main menu's labels have every letter it needs but the k; that one is lent from the stage
+select's names (Rocky, Lookout) and brought to the menu's size, as namefont.c already does between the stage and the
+song names. Read from archives 448 and 449 (size and CRC checked), the job takes about 60 ms in a thread of its own
+started with the first frame; the main menu waits for it if it is not done. The picture is turned into the sheet's
+own palette indices (the nearest colour of its table, alpha first) and written into the row. Composed again,
+"Dragon Net Battle" cannot be told from the disc's. Nothing of the disc is in the repository: the letters exist in
+memory only. With another edition of the game (archives that are not the USA release's) the label of
+port_tbo_label.h is written instead, as before.
+
+With a Menu font chosen, the item stayed in the disc's lettering, and so did the three labels on the same sheet
+(Character Reference, Options, Shenron): menu_text.c finds a sheet by a hash of all its pixels, and the list of labels
+had hashed the disc's sheet, without the item. (This was so from the start, with port_tbo_label.h too.) The list now
+writes the item into that sheet as the game writes it (the same nearest colours of the sheet's table,
+MenuLabels_ItemPixels, used by both), hashes that, and lists the item as the sheet's twelfth label; its version is
+v8, so an older list is made again.
+
+A room match found on these screens opened the screens again instead of the character select (seen by the user,
+two copies on one machine: both logs say "the start-up is over ... the character select", then the hub, then the
+session ended when it was left for the main menu). The session puts the game back to its first moment and goes to
+mode 39 (headless.c), and Duel_Main runs these screens whenever gPortDuelRole is 6: the role, set when the item was
+chosen and cleared only after the screens return, was still 6 in the session, so it is not among what the session
+puts back. Duel_Main now clears it in a session.
+
+The screen reader said nothing on these pages (reported by a tester with speech on): port/src/a11y_game.c reads each
+of the game's own screens from its state, and these pages drew their text as pictures of their own. Now the hosts'
+line is written by the game's own text box in the game's message window (battle/view_a_b.c, MsgWin_PortDrawString:
+TextBox_AttachString, the game's font and place), which the reader already reads as the game's lines; one or two
+lines start at the same height (the box's line offsets, MsgWin_PortSameTop), as before. And the pages say the rest
+themselves (port_tbo.c, Tb_Speak): the title as a page opens, what the cursor is on with its value, a keypad's key,
+the code (letter by letter) or name typed so far, the room's code while searching, the notes. Checked with
+BT3_A11Y_LOG (what would be said, into a file; the user went through the hub, Quick Match, Create Room and Join
+Room): the titles, every item with its value, the box's lines, the keys and the code as typed were all said. One fix
+from it: what was typed and where the cursor went in the same blank are one line (two in one blank, the second cut
+the first: the cursor's jump to JOIN after the sixth letter was lost). Not heard with a speech library here.
+
+Also learnt on the way (how menus are made is in [menus.md](menus.md)): the message box is drawn after the
+hosts and is see-through, so a host picture cut off at its edge shows the cut through the box (the announcer looked
+legless until his picture was made to run down behind the box to the foot of the screen); and a game file that
+fails to compile still lets the program link, with that file's old object (menu_labels.c once: "link OK", but one
+stub more than before). Look for `error:` in the build's output, not only for "link OK".
+
+The lines of the online screens themselves cannot be made that way: names, room codes and the hosts' lines need
+every character, which the disc's labels do not have. They keep being written with the Menu font. Measured against
+the disc's letters (cap height, widths of "Dragon Net Battle" and "Ultimate Training"), the game's lettering is a
+bold, slightly condensed humanist sans, not a rounded one; of the open fonts tried (DejaVu Sans Condensed Bold, Fira
+Sans Bold, Condensed Bold and Condensed ExtraBold, Noto Sans Bold), Fira Sans Condensed Bold is the nearest in
+proportions and shapes. It is bundled (port/third_party/fonts/fira, SIL Open Font License 1.1, from Mozilla's Fira
+release 4.301) and first in fonts.tsv, so it is the font of those screens while the Menu font setting is on
+"Original". Saved choices are kept by the file's path, so adding it at the top moved no one's setting.

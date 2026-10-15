@@ -46,7 +46,9 @@ void Port_NetLeave(void);
 
 enum { PAD = 18, RING = 4096, REDUNDANT = 16, MAGIC = 0x4E335442 /* "BT3N" */ };
 enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG = 6, T_CONFIG = 7, T_CONFIG_ACK = 8,
-       T_PUNCH = 9 /* nothing to read: sent so that the sender's router lets the other side's packets in (room codes) */ };
+       T_PUNCH = 9 /* nothing to read: sent so that the sender's router lets the other side's packets in (room codes) */,
+       T_CHAT = 10 /* a line of text between the players (net_chat.c): its number, its length, its bytes. Not part of
+                      the game: a copy without the chat ignores it, so NET_VERSION stays */ };
 /* The version of what goes over the line. The greeting and its answer carry it, and two copies that differ do not
    start a match (the input packets changed with version 2: times for the ping were added; a copy that read them
    the old way took them for input). 1 was releases 0.1.8 and 0.1.9, which said no version. */
@@ -59,6 +61,7 @@ static int sVersionBad; /* the other side answered with another version */
 static const uint32_t kVersion = NET_VERSION;
 #include "net_match.h"
 #include "net_relay.h"
+#include "net_chat.h"
 static int sLobbyOther;
 
 /* What the meter shows (ui.cpp): the round trip time, and per second how often the game went back, how far, and
@@ -470,6 +473,19 @@ static void send_inputs(void) {
     send_to_peer(pkt, (int)(IN_HEAD + n * PAD));
 }
 
+/* The lines of text that are due to go to the other player (net_chat.c: each is sent a few times). */
+static void chat_send(void) {
+    uint8_t pkt[16 + CHAT_TEXT];
+    uint32_t head[4] = {MAGIC, T_CHAT};
+    int len;
+
+    while (sConnected && (len = PortChat_Outgoing(now_ms(), &head[2], (char *)pkt + 16)) > 0) {
+        head[3] = (uint32_t)len;
+        memcpy(pkt, head, 16);
+        send_to_peer(pkt, 16 + len);
+    }
+}
+
 /* Takes in what has arrived. Returns 1 if anything did. */
 static int receive(void) {
     uint8_t pkt[2048];
@@ -478,6 +494,7 @@ static int receive(void) {
     int got = 0, n;
 
     queue_flush();
+    chat_send();
     while ((n = net_recv(pkt, (int)sizeof(pkt), &from)) >= 8) {
         uint32_t magic, type;
         memcpy(&magic, pkt, 4);
@@ -523,6 +540,13 @@ static int receive(void) {
             net_send(ack, sizeof(ack), &from);
         } else if (type == T_CONFIG_ACK && sMode == 1) {
             sCfgAcked = 1;
+        } else if (type == T_CHAT && sConnected && n >= 16) { /* (from the other player's address only: above) */
+            uint32_t seq, len;
+            memcpy(&seq, pkt + 8, 4);
+            memcpy(&len, pkt + 12, 4);
+            if (len <= CHAT_TEXT && len <= (uint32_t)(n - 16)) {
+                PortChat_Heard(seq, (const char *)pkt + 16, (int)len);
+            }
         } else if (type == T_BYE && sConnected) {
             uint32_t why = 0;
             if (n >= 12) {
@@ -683,6 +707,7 @@ static void net_start(int role, const char *host, const char *join) {
     sTick = 0;
     memset(sIn, 0, sizeof(sIn));
     memset(sHave, 0, sizeof(sHave)); /* (a second session in one run starts as clean as the first) */
+    PortChat_Reset();
     sWaitNs = sWaits = 0;
     sFromLobby = sHandSock >= 0;
     if (sFromLobby) {
@@ -1379,7 +1404,16 @@ void Port_NetSessionBegin(int role, const char *address, int port) {
     net_start(role, role == 1 ? host : NULL, role == 2 ? join : NULL);
 }
 
+/* How many sessions have ended in this run. The port's own memory: the game's is put back to the moment the session
+   was asked for, so this is how the screens that asked for it (menu/port_tbo.c) know it has been and gone. */
+static int sSessionsEnded;
+
+int Port_NetSessionsEnded(void) {
+    return sSessionsEnded;
+}
+
 void Port_NetSessionEnd(void) {
+    sSessionsEnded++;
     Relay_Close(sSock);
     if (sSock >= 0) {
         closesocket(sSock);
@@ -1387,6 +1421,7 @@ void Port_NetSessionEnd(void) {
     }
     sMode = 0;
     sSession = 0;
+    PortChat_Reset();
     put_env("BT3_SAVES", sSavesWasSet ? sSavesBefore : NULL);
 }
 
@@ -1404,6 +1439,7 @@ void Port_NetArrived(void) {
    normally is. */
 void Port_NetLeave(void) {
     fprintf(stderr, "bt3: net: the session has ended\n");
+    PortChat_Reset();
     if (sSock >= 0 && sConnected) { /* tell the other side, so that it does not wait for input that will not come */
         uint32_t bye[3] = {MAGIC, T_BYE, sByeWhy};
         int k;
@@ -1721,11 +1757,13 @@ void Port_LobbyLaunch(void);
 /* BT3_LOBBY=host or BT3_LOBBY=join:CODE: the room-code lobby driven without its window, once a blank (tests; the
    code and each change of state are written to the log). BT3_RELAY_ONLY=1: the one who joins tries nothing but the
    host's relay address. */
+static void lobby_background(void);
 void Port_LobbyAuto(void) {
     static int state = -99, begun, coded;
     const char *what = getenv("BT3_LOBBY");
     int now;
 
+    lobby_background();
     if (what == NULL || begun == 2 || Port_NetSession()) {
         return;
     }
@@ -1806,4 +1844,63 @@ int Port_NetStats(int *out) {
 /* 1 while a copy of another release is trying to join the lobby this copy hosts. */
 int Port_LobbyOther(void) {
     return sLobbyOther;
+}
+
+/* ---- Tenkaichi Budokai Online (menu/port_tbo.c), the game's own screens for the room-code lobby ----
+   The player's name is kept in online_name.txt beside the program. "Train While Waiting": the screens are left with
+   the room still open; from then on Port_LobbyAuto (each blank) polls it, and when the other player comes the
+   session begins wherever the game is (it starts from the game's first moment anyway). */
+static int sLobbyBg;
+
+const char *Port_NetNameGet(void) {
+    static int loaded;
+    if (!loaded) {
+        FILE *f = fopen("online_name.txt", "rb");
+        loaded = 1;
+        if (f != NULL) {
+            char line[64] = "";
+            size_t n = fread(line, 1, sizeof(line) - 1, f);
+            fclose(f);
+            line[n] = 0;
+            line[strcspn(line, "\r\n")] = 0;
+            if (line[0] != 0) {
+                Port_NetNameSet(line);
+            }
+        }
+    }
+    return sMyName;
+}
+
+void Port_NetNameSave(const char *name) {
+    FILE *f;
+    Port_NetNameSet(name);
+    f = fopen("online_name.txt", "wb");
+    if (f != NULL) {
+        fputs(sMyName, f);
+        fclose(f);
+    }
+}
+
+void Port_LobbyBackground(int on) {
+    sLobbyBg = on;
+}
+
+int Port_LobbyInBackground(void) {
+    return sLobbyBg;
+}
+
+static void lobby_background(void) {
+    int now;
+    if (!sLobbyBg || Port_NetSession()) {
+        return;
+    }
+    now = Port_LobbyPoll();
+    if (now == 2) {
+        sLobbyBg = 0;
+        Port_UiNotice("Tenkaichi Budokai Online: your opponent is here! The match begins.");
+        Port_LobbyLaunch();
+    } else if (now <= 0) {
+        sLobbyBg = 0;
+        Port_UiNotice(now == -3 ? Port_LobbyError() : "Tenkaichi Budokai Online: the room was closed.");
+    }
 }
