@@ -400,7 +400,18 @@ static void Tb_Note(char *line) {
     sTb->note = 150;
 }
 
+/* The page's name for the things that show where the player is (gPortScreenDetail: Discord's presence). */
+static void Tb_PageDetail(s32 mode) {
+    static const char *const names[] = {
+        "Hub", "Creating a Room", "Joining a Room", "Waiting for an Opponent", "Profile",
+        "Editing Profile Name", "Quick Match", "Training While Waiting", "Cannot Go Online",
+    };
+
+    Ps_Copy(gPortScreenDetail, mode >= 0 && mode < (s32)(sizeof(names) / sizeof(names[0])) ? names[mode] : "", sizeof(gPortScreenDetail));
+}
+
 static void Tb_SetMode(s32 mode) {
+    Tb_PageDetail(mode);
     sTb->typing = mode == TB_JOIN || mode == TB_NAME; /* the keyboard types on a keypad (elsewhere I is triangle ...) */
     Port_TextMode(sTb->typing);
     if (sTb->mode != mode) { /* (the page that is up again, as when the rival comes on the search: it does not come in anew) */
@@ -1923,6 +1934,7 @@ s32 PortTbo_Run(void) {
 
     sTb = Heap_Alloc(sizeof(TboScreen), 0x20, 0, 2);
     memset(sTb, 0, sizeof(TboScreen));
+    Tb_PageDetail(TB_HUB);
     sTb->hubCur = HUB_CREATE;
     sTb->hubY = Tb_HubRowY(HUB_CREATE);
     Tb_LoadChoices();
