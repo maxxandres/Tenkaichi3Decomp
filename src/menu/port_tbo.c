@@ -400,14 +400,42 @@ static void Tb_Note(char *line) {
     sTb->note = 150;
 }
 
-/* The page's name for the things that show where the player is (gPortScreenDetail: Discord's presence). */
+/* The page's name for the things that show where the player is (gPortScreenDetail: Discord's presence). One literal
+   per page, not a table of them: in the 64-bit build a pointer in a table is 4 bytes, and a table read through a
+   conditional (a literal on the other side) was loaded 8 bytes wide, so the first page crashed the Windows build. */
 static void Tb_PageDetail(s32 mode) {
-    static const char *const names[] = {
-        "Hub", "Creating a Room", "Joining a Room", "Waiting for an Opponent", "Profile",
-        "Editing Profile Name", "Quick Match", "Training While Waiting", "Cannot Go Online",
-    };
-
-    Ps_Copy(gPortScreenDetail, mode >= 0 && mode < (s32)(sizeof(names) / sizeof(names[0])) ? names[mode] : "", sizeof(gPortScreenDetail));
+    switch (mode) {
+    case TB_HUB:
+        Ps_Copy(gPortScreenDetail, "Hub", sizeof(gPortScreenDetail));
+        break;
+    case TB_CREATE:
+        Ps_Copy(gPortScreenDetail, "Creating a Room", sizeof(gPortScreenDetail));
+        break;
+    case TB_JOIN:
+        Ps_Copy(gPortScreenDetail, "Joining a Room", sizeof(gPortScreenDetail));
+        break;
+    case TB_WAIT:
+        Ps_Copy(gPortScreenDetail, "Waiting for an Opponent", sizeof(gPortScreenDetail));
+        break;
+    case TB_PROFILE:
+        Ps_Copy(gPortScreenDetail, "Profile", sizeof(gPortScreenDetail));
+        break;
+    case TB_NAME:
+        Ps_Copy(gPortScreenDetail, "Editing Profile Name", sizeof(gPortScreenDetail));
+        break;
+    case TB_QUICK:
+        Ps_Copy(gPortScreenDetail, "Quick Match", sizeof(gPortScreenDetail));
+        break;
+    case TB_SPAR:
+        Ps_Copy(gPortScreenDetail, "Training While Waiting", sizeof(gPortScreenDetail));
+        break;
+    case TB_BLOCK:
+        Ps_Copy(gPortScreenDetail, "Cannot Go Online", sizeof(gPortScreenDetail));
+        break;
+    default:
+        gPortScreenDetail[0] = 0;
+        break;
+    }
 }
 
 static void Tb_SetMode(s32 mode) {
